@@ -6,8 +6,9 @@ import tempfile
 from typing import List, Optional
 
 import click
+import oci
 
-from ubuntu_cloud_image_changelog import launchpadagent, lib
+from ubuntu_cloud_image_changelog import launchpadagent, lib, oci_manifest
 from ubuntu_cloud_image_changelog.models import (
     Added,
     ChangelogModel,
@@ -640,6 +641,189 @@ def generate(
                 ouput_json_file.write(changelog.model_dump_json(indent=4))
             else:
                 ouput_json_file.write(changelog.model_dump_json())
+
+
+@cli.command()
+@click.option(
+    "--lp-credentials-store",
+    envvar="LP_CREDENTIALS_STORE",
+    required=False,
+    help="An optional path to an already configured launchpad credentials store.",
+    default=None,
+)
+@click.option("--series", help='the Ubuntu series eg. "noble" or "jammy"', required=True)
+@click.option(
+    "--namespace",
+    help="The OCI Object Storage namespace to query for manifests.",
+    required=False,
+    default="intcanonical",
+    show_default=True,
+)
+@click.option(
+    "--bucket",
+    help="The OCI Object Storage bucket to query for the latest promoted manifests. "
+    "'Published' is defined as the latest manifest(s) present in this bucket rather than "
+    "Oracle's public catalog, as there is no reliable, API-traceable way to map an Oracle "
+    "catalog listing back to our build serial.",
+    required=False,
+    default="platform-shared",
+    show_default=True,
+)
+@click.option(
+    "--oci-config-file",
+    help="Path to an OCI config file. Defaults to the standard ~/.oci/config used by the OCI CLI/SDK.",
+    required=False,
+    default=None,
+)
+@click.option(
+    "--oci-profile",
+    help="The profile within the OCI config file to use.",
+    required=False,
+    default="DEFAULT",
+    show_default=True,
+)
+@click.option(
+    "--ppa",
+    "ppas",
+    required=False,
+    multiple=True,
+    type=click.STRING,
+    help="Packages in manifest are known to have been installed from this PPA."
+    "Expected format is "
+    "'%LAUNCHPAD_USERNAME%/%PPA_NAME%' eg. philroche/cloud-init"
+    "Multiple --ppa options can be specified",
+)
+@click.option(
+    "--image-architecture",
+    help="The architecture of the image to use, both when selecting which manifest variant to "
+    "download and when querying package version in the archive/ppa. The default is amd64",
+    default="amd64",
+    show_default=True,
+)
+@click.option(
+    "--image-type",
+    help="The image type/variant of manifest to use eg. 'server' or 'minimal'. "
+    "A serial can publish more than one image type, and not every serial publishes every "
+    "type, so this selects which one to diff.",
+    default="server",
+    show_default=True,
+)
+@click.option(
+    "--highlight-cves",
+    help="Highlight the CVEs referenced in each individual changelog entry" ". Default: %(default)s",
+    is_flag=True,
+    default=False,
+)
+@click.option(
+    "--output-json",
+    help="Output the changelog in JSON format to the specified file",
+    type=click.Path(exists=False, dir_okay=False, writable=True),
+    default=None,
+)
+@click.option(
+    "--output-json-pretty",
+    help="Output the JSON changelog in a human readable format. "
+    "This option is ignored if `--output-json` is not specified.",
+    is_flag=True,
+    default=False,
+)
+@click.option(
+    "--notes",
+    help="Free form text to include in the changelog. ",
+    default=None,
+    show_default=True,
+)
+@click.pass_context
+def generate_from_oci(
+    ctx,
+    lp_credentials_store: Optional[str],
+    series: str,
+    namespace: str,
+    bucket: str,
+    oci_config_file: Optional[str],
+    oci_profile: str,
+    ppas: List[str],
+    image_architecture: str,
+    image_type: str,
+    highlight_cves: bool,
+    output_json: Optional[str],
+    output_json_pretty: bool,
+    notes: Optional[str],
+):
+    """Automatically find the two most recently promoted manifests for a series in OCI Object
+    Storage, download them, and generate a changelog between them.
+
+    This automates the manual steps proven out during the CPC-3345 spike: list the given
+    bucket (``platform-shared`` by default) for the given series/arch/image-type, pick the two
+    newest promoted serials, download their manifests, and hand them to `generate`.
+    """
+    try:
+        object_storage_client = oci_manifest.get_object_storage_client(
+            oci_config_file=oci_config_file,
+            oci_profile=oci_profile,
+        )
+    except (oci.exceptions.ConfigFileNotFound, oci.exceptions.InvalidConfig) as e:
+        raise click.ClickException(
+            "Unable to build an OCI Object Storage client from the given config/profile: {}".format(e)
+        )
+
+    try:
+        to_manifest_object, from_manifest_object = oci_manifest.find_latest_manifests(
+            object_storage_client,
+            namespace,
+            bucket,
+            series,
+            arch=image_architecture,
+            image_type=image_type,
+            count=2,
+        )
+    except oci.exceptions.ServiceError as e:
+        raise click.ClickException(
+            "OCI Object Storage request failed while listing manifests in bucket '{}': {}".format(bucket, e)
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    click.echo(
+        "Found latest two '{}' '{}' manifests in bucket '{}' for series '{}': from serial {}, to serial {}".format(
+            image_architecture,
+            image_type,
+            bucket,
+            series,
+            from_manifest_object.serial,
+            to_manifest_object.serial,
+        )
+    )
+
+    with tempfile.TemporaryDirectory(prefix="ubuntu-cloud-image-changelog-oci") as tmp_manifest_directory:
+        from_manifest_path = os.path.join(tmp_manifest_directory, "from.manifest")
+        to_manifest_path = os.path.join(tmp_manifest_directory, "to.manifest")
+        try:
+            oci_manifest.download_manifest(
+                object_storage_client, namespace, bucket, from_manifest_object, from_manifest_path
+            )
+            oci_manifest.download_manifest(
+                object_storage_client, namespace, bucket, to_manifest_object, to_manifest_path
+            )
+        except oci.exceptions.ServiceError as e:
+            raise click.ClickException("OCI Object Storage request failed while downloading a manifest: {}".format(e))
+
+        with open(from_manifest_path, "rb") as from_manifest, open(to_manifest_path, "rb") as to_manifest:
+            ctx.invoke(
+                generate,
+                lp_credentials_store=lp_credentials_store,
+                from_series=series,
+                to_series=series,
+                from_serial=from_manifest_object.serial,
+                to_serial=to_manifest_object.serial,
+                from_manifest=from_manifest,
+                to_manifest=to_manifest,
+                ppas=ppas,
+                image_architecture=image_architecture,
+                highlight_cves=highlight_cves,
+                output_json=output_json,
+                output_json_pretty=output_json_pretty,
+                notes=notes,
+            )
 
 
 def echo_changes(highlight_cves, version_changelog_change):
